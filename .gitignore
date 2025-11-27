@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# VS Code
+.vscode/
+
+# VR-RL Specific Large Files
+*.pt
+*.pth
+buffer_dump.pt
+vrrl_final_model.pth
+
+# Logs
+runs/
+telemetry_logs/
+*.csv
+
+# OS
+.DS_Store
