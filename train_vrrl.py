@@ -23,6 +23,7 @@ from collections import deque
 from dataclasses import dataclass, asdict
 import os
 import wandb
+import tqdm
 
 # Import the environment wrapper
 from carla_env_wrapper import CarlaEnv
@@ -435,18 +436,20 @@ def train(run):
     # ---------------------------------------------------------
     if os.path.exists(buffer_path):
         buffer.load(buffer_path)
-        print("[Phase 1] Skipped collection (loaded from file).")
+        print(f"[Phase 1] Skipped collection (loaded from file: {buffer_path}).")
     else:
         print("\n[Phase 1] Collecting data (20,000 frames)...")
-        obs, _ = env.reset()
-        for i in range(20000):
-            action = env.action_space.sample()
-            next_obs, _, done, _, _ = env.step(action)
-            buffer.add(obs[0], obs[1], action, 0, done, 0, 0)
-            obs = next_obs
-            if done: obs, _ = env.reset()
-            if i % 1000 == 0: print(f"  Collected {i} frames...")
-        buffer.save(buffer_path)
+        n_frames = 20_000
+        with tqdm.tqdm(total=n_frames, desc="Collecting frames") as pbar:
+            obs, _ = env.reset()
+            for i in range(n_frames):
+                action = env.action_space.sample()
+                next_obs, _, done, _, _ = env.step(action)
+                buffer.add(obs[0], obs[1], action, 0, done, 0, 0)
+                obs = next_obs
+                if done: obs, _ = env.reset()
+                pbar.update(1)
+            buffer.save(buffer_path)
 
     # ---------------------------------------------------------
     # PHASE 1: CVAE TRAINING (Representation Learning)
@@ -485,6 +488,7 @@ def train(run):
     # ---------------------------------------------------------
     print("\n[Phase 2] Starting Policy Optimization...")
     buffer.clear() # Clear old random data
+    timesteps = 0
     
     for p in vr_model.parameters(): p.requires_grad = False
     vr_model.eval() # Freeze CVAE for stable features
@@ -513,6 +517,7 @@ def train(run):
             np_act = action.squeeze().cpu().numpy()
             
             next_obs, reward, done, _, _ = env.step(np_act)
+            timesteps += 1
             
             # Scale Reward: Helps PPO learn from small signals
             scaled_reward = reward * 10.0 
@@ -582,7 +587,7 @@ def train(run):
             buffer.clear()
             
         current_lr = lr_scheduler.get_last_lr()[0]
-        print(f"Episode {ep} | Reward: {ep_reward:.2f} | LR: {current_lr:.6f} | EntropyCoef: {current_ent_coef:.4f}")
+        print(f"T={timesteps} | Episode {ep} | Reward: {ep_reward:.2f} | LR: {current_lr:.6f} | EntropyCoef: {current_ent_coef:.4f}")
         writer.add_scalar("RL/Reward", ep_reward, ep)
         writer.add_scalar("RL/LearningRate", current_lr, ep)
 
@@ -620,7 +625,7 @@ def train(run):
                 f"  [EVAL] Episode {ep} | Avg Deterministic Reward: {avg_eval:.2f} | "
                 f"Std Deterministic Reward: {std_eval:.2f}"
             )
-            run.log({"Episode": ep, "EvalMeanReward": avg_eval, "EvalStdReward": std_eval})
+            run.log({"Episode": ep, "EvalMeanReward": avg_eval, "EvalStdReward": std_eval}, step=timesteps)
             writer.add_scalar("RL/Eval_Reward", avg_eval, ep)
 
 
