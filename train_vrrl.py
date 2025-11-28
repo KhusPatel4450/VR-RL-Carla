@@ -20,8 +20,9 @@ import torch.nn.functional as F
 from torch.distributions import Normal
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import os
+import wandb
 
 # Import the environment wrapper
 from carla_env_wrapper import CarlaEnv
@@ -41,10 +42,10 @@ class Config:
     action_dim: int = 2    # Steering [-1, 1], Throttle [0, 1]
     
     # --- CVAE (Vision System) ---
-    z_dim: int = 64        # Size of the Latent Vector (Random Noise)
+    z_dim: int = 95        # Size of the Latent Vector (Random Noise)
     rep_dim: int = 256     # Size of the Representation (Output to PPO)
     beta_target: float = 1.0 # Weight of KL Divergence term (Regularization)
-    cvae_lr: float = 3e-4  # Learning Rate for CVAE
+    cvae_lr: float = 1e-4  # Learning Rate for CVAE
     
     # --- PPO (Driving Agent) ---
     gamma: float = 0.99    # Discount factor (importance of future rewards)
@@ -52,7 +53,8 @@ class Config:
     clip_range: float = 0.2 # PPO clipping (prevents drastic policy changes)
     entropy_coef: float = 0.01 # Initial exploration randomness
     value_coef: float = 0.5  # Weight of Critic loss
-    ppo_lr: float = 3e-4   # Learning Rate for PPO
+    ppo_lr: float = 3e-4   # Learning Rate for PPO [threshold: 0.000279]
+    ppo_lr_min: float = 0.000279   # Minimum Learning Rate for PPO [threshold: 0.000279]
     ppo_epochs: int = 10   # Number of updates per batch
     ppo_batch_size: int = 64
     
@@ -98,6 +100,80 @@ class Encoder(nn.Module):
     def forward(self, x):
         h = self.net(x)
         return self.fc_mu(h), self.fc_logvar(h)
+
+class VanillaDecoder(nn.Module):
+    """
+    The core of VR-RL.
+    Takes an Observation (Image) AND a Latent Code (z).
+    Outputs a Representation (r) for the Agent, and Reconstructs the Image.
+    """
+    def __init__(self):
+        super().__init__()
+        dummy_enc = Encoder()
+        self.flat_dim = dummy_enc.flat_dim # 25,600
+        
+        # 1. Visual Feature Extractor (Deterministic Path)
+        self.obs_processor = nn.Sequential(
+            nn.Conv2d(cfg.channels, 32, 4, 2), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2), nn.ReLU(),
+            nn.Conv2d(64, 128, 4, 2), nn.ReLU(),
+            nn.Flatten()
+        )
+        
+        # 2. [CRITICAL] Compression Bottleneck
+        # We compress the 25,600 visual features down to 128.
+        # Why? If we don't, the massive visual signal drowns out the tiny z signal (64),
+        # causing "Posterior Collapse" (KL=0). This forces the model to use z.
+        self.compress_obs = nn.Sequential(
+            nn.Linear(self.flat_dim, 128),
+            nn.ReLU()
+        )
+        
+        # Dropout forces the model to rely on z when visual features are noisy
+        self.obs_dropout = nn.Dropout(p=0.5) 
+        
+        # 3. Fusion Layer (Visuals + Latent)
+        # Combines Compressed Visuals (128) + Latent z (64)
+        self.fc_combine = nn.Linear(cfg.z_dim, 512)
+        
+        # 4. Representation Layer (The Output for PPO)
+        self.fc_rep = nn.Linear(512, cfg.rep_dim) 
+        
+        # 5. Reconstruction Head (Only used for CVAE training)
+        self.fc_recon = nn.Linear(cfg.rep_dim, self.flat_dim)
+        self.deconv = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 5, 2, padding=1), nn.ReLU(), 
+            nn.ConvTranspose2d(64, 32, 5, 2, padding=1), nn.ReLU(),
+            nn.ConvTranspose2d(32, cfg.channels, 6, 2, padding=1), nn.Sigmoid()
+        )
+
+    def get_rep(self, obs, z):
+        """
+        Fast inference method for Phase 2 (RL).
+        Does NOT reconstruct the image, only calculates 'r'.
+        """
+        return self(obs, z)[0] # returns the representation
+        # obs_feat = self.obs_processor(obs)
+        # obs_feat = self.compress_obs(obs_feat) # Apply bottleneck
+        # # Note: No dropout during inference!
+        # h = torch.cat([obs_feat, z], dim=1)
+        # h = F.relu(self.fc_combine(h))
+        # r = torch.tanh(self.fc_rep(h))
+        # return r
+
+    def forward(self, obs, z):
+        """Full forward pass for Phase 1 (CVAE Training)."""
+        h = F.relu(self.fc_combine(z))
+        r = torch.tanh(self.fc_rep(h)) # The Representation
+        
+        # Reconstruction logic
+        recon_h = F.relu(self.fc_recon(r))
+        recon_h = recon_h.view(-1, 128, 8, 18) # Reshape to image tensor
+        out = self.deconv(recon_h)
+        recon_img = F.interpolate(out, size=(cfg.img_h, cfg.img_w), mode='bilinear')
+        
+        return r, recon_img
+
 
 class Decoder(nn.Module):
     """
@@ -150,13 +226,14 @@ class Decoder(nn.Module):
         Fast inference method for Phase 2 (RL).
         Does NOT reconstruct the image, only calculates 'r'.
         """
-        obs_feat = self.obs_processor(obs)
-        obs_feat = self.compress_obs(obs_feat) # Apply bottleneck
-        # Note: No dropout during inference!
-        h = torch.cat([obs_feat, z], dim=1)
-        h = F.relu(self.fc_combine(h))
-        r = torch.tanh(self.fc_rep(h))
-        return r
+        return self(obs, z)[0] # returns the representation
+        # obs_feat = self.obs_processor(obs)
+        # obs_feat = self.compress_obs(obs_feat) # Apply bottleneck
+        # # Note: No dropout during inference!
+        # h = torch.cat([obs_feat, z], dim=1)
+        # h = F.relu(self.fc_combine(h))
+        # r = torch.tanh(self.fc_rep(h))
+        # return r
 
     def forward(self, obs, z):
         """Full forward pass for Phase 1 (CVAE Training)."""
@@ -184,7 +261,7 @@ class VRRL_Model(nn.Module):
     def __init__(self):
         super().__init__()
         self.encoder = Encoder()
-        self.decoder = Decoder()
+        self.decoder = VanillaDecoder()
 
     def forward_train(self, x):
         """Standard VAE Forward Pass: Encode -> Sample -> Decode"""
@@ -205,10 +282,14 @@ class ActorCritic(nn.Module):
         input_dim = cfg.rep_dim + cfg.nav_dim
         
         # Actor: Decides Steering/Throttle
-        self.actor = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.Tanh(),
-            nn.Linear(256, 256), nn.Tanh(),
-            nn.Linear(256, cfg.action_dim)
+        self.actor = self.critic = nn.Sequential(
+            nn.Linear(input_dim, 500),
+            nn.Tanh(),
+            nn.Linear(500, 300),
+            nn.Tanh(),
+            nn.Linear(300, 100),
+            nn.Tanh(),
+            nn.Linear(100, cfg.action_dim)
         )
         # Exploration Noise Parameter
         # Initialized to 0.0 (High Noise) to prevent early stagnation ("Parking")
@@ -216,9 +297,13 @@ class ActorCritic(nn.Module):
         
         # Critic: Estimates Value of current state
         self.critic = nn.Sequential(
-            nn.Linear(input_dim, 256), nn.Tanh(),
-            nn.Linear(256, 256), nn.Tanh(),
-            nn.Linear(256, 1)
+            nn.Linear(input_dim, 500),
+            nn.Tanh(),
+            nn.Linear(500, 300),
+            nn.Tanh(),
+            nn.Linear(300, 100),
+            nn.Tanh(),
+            nn.Linear(100, 1)
         )
 
     def get_action(self, state, deterministic=False):
@@ -321,7 +406,7 @@ class Buffer:
 # MAIN TRAINING LOOP
 # ============================================================
 
-def train():
+def train(run):
     
 
     env = CarlaEnv(visual_display=False)
@@ -333,15 +418,17 @@ def train():
     policy = ActorCritic().to(cfg.device)
     policy_opt = torch.optim.Adam(policy.parameters(), lr=cfg.ppo_lr)
     
+    decay_ratio = cfg.ppo_lr_min / cfg.ppo_lr
     # LR Scheduler: Linearly decays Learning Rate to 0 over training
     # This improves stability in later episodes.
     lr_scheduler = torch.optim.lr_scheduler.LinearLR(
-        policy_opt, start_factor=1.0, end_factor=0.01, total_iters=cfg.rl_episodes
+        policy_opt, start_factor=1.0, end_factor=decay_ratio, total_iters=cfg.rl_episodes
     )
     
     buffer = Buffer()
     writer = SummaryWriter(log_dir="runs/vr_rl_final")
     buffer_path = "buffer_dump.pt"
+    vae_path = "vae_dump.pt"
 
     # ---------------------------------------------------------
     # PHASE 1: DATA COLLECTION (Once)
@@ -366,24 +453,30 @@ def train():
     # ---------------------------------------------------------
     print("[Phase 1] Training CVAE...")
     vr_model.train()
-    for i in range(cfg.pretrain_steps):
-        img_batch = buffer.sample_images(cfg.batch_size)
-        recon_batch, mu, logvar = vr_model.forward_train(img_batch)
-        
-        # Anneal Beta: Gradually increase regularization to prevent collapse
-        beta = min(1.0, i / 5000.0) * cfg.beta_target
-        
-        # Loss = Reconstruction + Beta * KL Divergence
-        recon_loss = F.mse_loss(recon_batch, img_batch, reduction='sum') / cfg.batch_size
-        kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / cfg.batch_size
-        loss = recon_loss + beta * kl_loss
-        
-        cvae_opt.zero_grad()
-        loss.backward()
-        cvae_opt.step()
-        
-        if i % 500 == 0:
-            print(f"  Step {i} | Loss: {loss.item():.4f} | KL: {kl_loss.item():.4f}")
+    if os.path.exists(vae_path):
+        vr_model.load_state_dict(torch.load(vae_path))
+        print("[Phase 1] Loaded CVAE from file.")
+    else:
+        print("[Phase 1] Training CVAE from scratch.")
+        for i in range(cfg.pretrain_steps):
+            img_batch = buffer.sample_images(cfg.batch_size)
+            recon_batch, mu, logvar = vr_model.forward_train(img_batch)
+            
+            # Anneal Beta: Gradually increase regularization to prevent collapse
+            beta = min(1.0, i / 5000.0) * cfg.beta_target
+            
+            # Loss = Reconstruction + Beta * KL Divergence
+            recon_loss = F.mse_loss(recon_batch, img_batch, reduction='sum') / cfg.batch_size
+            kl_loss = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / cfg.batch_size
+            loss = recon_loss + beta * kl_loss
+            
+            cvae_opt.zero_grad()
+            loss.backward()
+            cvae_opt.step()
+            
+            if i % 500 == 0:
+                print(f"  Step {i} | Loss: {loss.item():.4f} | KL: {kl_loss.item():.4f}")
+        torch.save(vr_model.state_dict(), vae_path)
 
     print("[Phase 1] Complete. Encoder Discarded.")
 
@@ -410,6 +503,8 @@ def train():
             
             # VR-RL Core: Sample random Z (stochastic augmentation)
             with torch.no_grad():
+                # z_mean, z_logvar = vr_model.encoder(img)
+                # z = sample_z(z_mean, z_logvar)
                 z = torch.randn(1, cfg.z_dim, device=cfg.device)
                 rep = vr_model.decoder.get_rep(img, z)
             
@@ -438,6 +533,8 @@ def train():
             with torch.no_grad():
                 last_img = torch.tensor(next_obs[0]).permute(2,0,1).unsqueeze(0).to(cfg.device).float()/255.0
                 last_nav = torch.tensor(next_obs[1]).unsqueeze(0).to(cfg.device).float()
+                # z_mean, z_logvar = vr_model.encoder(img)
+                # z = sample_z(z_mean, z_logvar)
                 z = torch.randn(1, cfg.z_dim, device=cfg.device)
                 last_rep = vr_model.decoder.get_rep(last_img, z)
                 last_val = policy.critic(torch.cat([last_rep, last_nav], dim=1)).item()
@@ -475,6 +572,7 @@ def train():
                 critic_loss = F.mse_loss(new_vals, returns)
                 
                 loss = actor_loss + cfg.value_coef * critic_loss - current_ent_coef * entropy.mean()
+                # print(f"Entropy: {entropy.mean().item():.4f}")
                 
                 policy_opt.zero_grad()
                 loss.backward()
@@ -484,7 +582,7 @@ def train():
             buffer.clear()
             
         current_lr = lr_scheduler.get_last_lr()[0]
-        print(f"Episode {ep} | Reward: {ep_reward:.2f} | LR: {current_lr:.6f}")
+        print(f"Episode {ep} | Reward: {ep_reward:.2f} | LR: {current_lr:.6f} | EntropyCoef: {current_ent_coef:.4f}")
         writer.add_scalar("RL/Reward", ep_reward, ep)
         writer.add_scalar("RL/LearningRate", current_lr, ep)
 
@@ -493,7 +591,7 @@ def train():
         # ---------------------------------------------------------
         if ep > 0 and ep % cfg.eval_interval == 0:
             eval_scores = []
-            for _ in range(3): 
+            for _ in range(3):
                 e_obs, _ = env.reset()
                 e_rew = 0
                 while True:
@@ -502,6 +600,8 @@ def train():
                     
                     with torch.no_grad():
                         e_z = torch.randn(1, cfg.z_dim, device=cfg.device)
+                        # z_mean, z_logvar = vr_model.encoder(e_img)
+                        # z = sample_z(z_mean, z_logvar)
                         e_rep = vr_model.decoder.get_rep(e_img, e_z)
                         e_state = torch.cat([e_rep, e_nav], dim=1)
                         # Deterministic = True (No noise)
@@ -515,11 +615,30 @@ def train():
                 eval_scores.append(e_rew)
             
             avg_eval = np.mean(eval_scores)
-            print(f"  [EVAL] Episode {ep} | Avg Deterministic Reward: {avg_eval:.2f}")
+            std_eval = np.std(eval_scores)
+            print(
+                f"  [EVAL] Episode {ep} | Avg Deterministic Reward: {avg_eval:.2f} | "
+                f"Std Deterministic Reward: {std_eval:.2f}"
+            )
+            run.log({"Episode": ep, "EvalMeanReward": avg_eval, "EvalStdReward": std_eval})
             writer.add_scalar("RL/Eval_Reward", avg_eval, ep)
 
+
+def sample_z(z_mean, z_logvar):
+    z_noise = torch.randn_like(z_mean)
+    eps = torch.randn_like(z_mean)
+    z = z_mean + torch.exp(0.5 * z_logvar) * eps
+    return z + z_noise
+
 if __name__ == "__main__":
-    try:
-        train()
-    except KeyboardInterrupt:
-        print("Interrupted.")
+    with open("tmp/wandb_api_key.txt", "r") as f:
+        wandb.login(key=f.read().strip())
+    with wandb.init(
+        entity="evorl",
+        project="vr-rl-carla",
+        config=asdict(cfg),
+    ) as run:
+        try:
+            train(run)
+        except KeyboardInterrupt:
+            print("Interrupted.")

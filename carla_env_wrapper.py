@@ -32,7 +32,7 @@ TIMEOUT = 20.0
 CAR_NAME = "model3"
 
 # Maximum duration of one episode (50 seconds at 20 FPS)
-EPISODE_MAX_STEPS = 1000
+EPISODE_MAX_STEPS = 2000
 
 # Camera Settings
 # We use Semantic Segmentation for the Agent (cleaner view of road/lanes)
@@ -272,13 +272,13 @@ class CarlaEnv(gym.Env):
         # --- 4. Penalties & Termination ---
         if len(self.collision_hist) > 0:
             done = True
-            reward = -100.0 # Crash Penalty
+            reward = -10.0 # Crash Penalty
         elif self.distance_from_center > self.max_distance_from_center:
             done = True
-            reward = -100.0 # Off-road Penalty
+            reward = -10.0 # Off-road Penalty
         elif self.timesteps >= EPISODE_MAX_STEPS:
             done = True
-            reward = 0.0 # Safe finish
+            reward = 1000.0 # Safe finish
         else:
             reward = step_reward
 
