@@ -260,7 +260,7 @@ class CarlaEnv(gym.Env):
         # --- 2. Basic Step Reward ---
         # Multiplicative: If ANY factor is bad, the whole reward drops.
         # This forces the agent to be fast AND centered AND aligned.
-        step_reward = r_speed * r_center * r_angle
+        step_reward = r_speed + r_center + r_angle
 
         # --- 3. Bonuses (Incentivize Perfection) ---
         # If driving fast and perfect, give extra points.

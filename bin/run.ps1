@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-$CarlaExecPath = "$Env:USERPROFILE\Downloads\CARLA_0.9.16\CarlaUE4.exe"
+$CarlaExecPath = "$Env:USERPROFILE\Desktop\Khush\VR-RL_Carla\CarlaUE4.exe"
 
 try {
     Write-Host "Starting CarlaUE4.exe"

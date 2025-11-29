@@ -61,7 +61,7 @@ class Config:
     
     # --- Training Schedule ---
     pretrain_steps: int = 15000 # Steps to train CVAE (Phase 1)
-    rl_episodes: int = 2000     # Episodes to train PPO (Phase 2)
+    rl_episodes: int = 8000 # (~2M timesteps)     # Episodes to train PPO (Phase 2)
     eval_interval: int = 25     # How often to run a Deterministic Test
     buffer_size: int = 50000    # Replay buffer capacity
     batch_size: int = 128       # Batch size for CVAE training
@@ -272,6 +272,17 @@ class VRRL_Model(nn.Module):
         r, x_hat = self.decoder(x, z)        # Conditional Decoding
         return x_hat, mu, logvar
 
+    def get_noisy_reconstruction(self, x):
+        mu, logvar = self.encoder(x)
+
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mu + std * eps
+
+        r, x_hat = self.decoder(x, z) 
+
+        return r, x_hat
+
 # ============================================================
 # PPO AGENT
 # ============================================================
@@ -280,11 +291,19 @@ class ActorCritic(nn.Module):
     """The Driver (Policy) and the Judge (Critic)"""
     def __init__(self):
         super().__init__()
-        input_dim = cfg.rep_dim + cfg.nav_dim
-        
+        # input_dim = cfg.rep_dim + cfg.nav_dim
+        self.visual_net = nn.Sequential(
+            nn.Conv2d(cfg.channels, 32, 4, 2), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, 2), nn.ReLU(),
+            nn.Conv2d(64, 128, 4, 2), nn.ReLU(),
+            nn.Flatten()
+        )
+        dummy_enc = Encoder()
+        self.flat_dim = dummy_enc.flat_dim
+        total_input = self.flat_dim + cfg.nav_dim
         # Actor: Decides Steering/Throttle
-        self.actor = self.critic = nn.Sequential(
-            nn.Linear(input_dim, 500),
+        self.actor = nn.Sequential(
+            nn.Linear(total_input, 500),
             nn.Tanh(),
             nn.Linear(500, 300),
             nn.Tanh(),
@@ -298,7 +317,7 @@ class ActorCritic(nn.Module):
         
         # Critic: Estimates Value of current state
         self.critic = nn.Sequential(
-            nn.Linear(input_dim, 500),
+            nn.Linear(total_input, 500),
             nn.Tanh(),
             nn.Linear(500, 300),
             nn.Tanh(),
@@ -307,8 +326,10 @@ class ActorCritic(nn.Module):
             nn.Linear(100, 1)
         )
 
-    def get_action(self, state, deterministic=False):
+    def get_action(self, image, nav, deterministic=False):
         """Selects an action based on state"""
+        visual_features = self.visual_net(image)
+        state = torch.cat([visual_features, nav], dim=1)
         mu = self.actor(state)
         std = torch.exp(self.log_std)
         dist = Normal(mu, std)
@@ -321,12 +342,19 @@ class ActorCritic(nn.Module):
         action = dist.sample()
         return action, dist.log_prob(action).sum(dim=-1), self.critic(state)
 
-    def evaluate(self, state, action):
+    def evaluate(self, image, nav, action):
         """Evaluates actions for PPO Update"""
+        visual_features = self.visual_net(image)
+        state = torch.cat([visual_features, nav], dim=1)
         mu = self.actor(state)
         std = torch.exp(self.log_std)
         dist = Normal(mu, std)
         return dist.log_prob(action).sum(dim=-1), dist.entropy().sum(dim=-1), self.critic(state).squeeze(-1)
+
+    def value(self, image, nav):
+        visual_features = self.visual_net(image)
+        state = torch.cat([visual_features, nav], dim=1)
+        return self.critic(state).squeeze(-1).item()
 
 # ============================================================
 # BUFFER (Experience Replay)
@@ -504,21 +532,15 @@ def train(run):
         while True:
             img = torch.tensor(obs[0]).permute(2,0,1).unsqueeze(0).to(cfg.device).float() / 255.0
             nav = torch.tensor(obs[1]).unsqueeze(0).to(cfg.device).float()
-            
-            # VR-RL Core: Sample random Z (stochastic augmentation)
+
             with torch.no_grad():
-                # z_mean, z_logvar = vr_model.encoder(img)
-                # z = sample_z(z_mean, z_logvar)
-                z = torch.randn(1, cfg.z_dim, device=cfg.device)
-                rep = vr_model.decoder.get_rep(img, z)
-            
-            state = torch.cat([rep, nav], dim=1)
-            action, log_prob, val = policy.get_action(state)
+                _, noisy_recon = vr_model.get_noisy_reconstruction(img)
+
+            action, log_prob, val = policy.get_action(noisy_recon, nav)
             np_act = action.squeeze().cpu().numpy()
-            
             next_obs, reward, done, _, _ = env.step(np_act)
             timesteps += 1
-            
+
             # Scale Reward: Helps PPO learn from small signals
             scaled_reward = reward * 10.0 
             
@@ -538,11 +560,10 @@ def train(run):
             with torch.no_grad():
                 last_img = torch.tensor(next_obs[0]).permute(2,0,1).unsqueeze(0).to(cfg.device).float()/255.0
                 last_nav = torch.tensor(next_obs[1]).unsqueeze(0).to(cfg.device).float()
-                # z_mean, z_logvar = vr_model.encoder(img)
-                # z = sample_z(z_mean, z_logvar)
-                z = torch.randn(1, cfg.z_dim, device=cfg.device)
-                last_rep = vr_model.decoder.get_rep(last_img, z)
-                last_val = policy.critic(torch.cat([last_rep, last_nav], dim=1)).item()
+                # last_rep = vr_model.decoder.get_rep(last_img, z)
+                _, last_recon = vr_model.get_noisy_reconstruction(last_img)
+                # last_val = policy.critic(torch.cat([batch_recon, last_nav], dim=1)).item()
+                last_val = policy.value(last_recon, last_nav)
             
             # Compute GAE (Generalized Advantage Estimation)
             advantages = torch.zeros_like(rews)
@@ -563,11 +584,11 @@ def train(run):
             for _ in range(cfg.ppo_epochs):
                 with torch.no_grad():
                     # Augment data: Re-sample Z for every batch
-                    batch_z = torch.randn(imgs.size(0), cfg.z_dim, device=cfg.device)
-                    batch_reps = vr_model.decoder.get_rep(imgs, batch_z)
-                    batch_states = torch.cat([batch_reps, navs], dim=1)
+                    # batch_z = torch.randn(imgs.size(0), cfg.z_dim, device=cfg.device)
+                    _, batch_recons = vr_model.get_noisy_reconstruction(imgs)
+                    # batch_states = torch.cat([batch_reps, navs], dim=1)
 
-                new_logps, entropy, new_vals = policy.evaluate(batch_states, acts)
+                new_logps, entropy, new_vals = policy.evaluate(batch_recons, navs, acts)
                 ratio = torch.exp(new_logps - old_logps)
                 
                 # PPO Clipped Loss
@@ -604,13 +625,13 @@ def train(run):
                     e_nav = torch.tensor(e_obs[1]).unsqueeze(0).to(cfg.device).float()
                     
                     with torch.no_grad():
-                        e_z = torch.randn(1, cfg.z_dim, device=cfg.device)
+                        # e_z = torch.randn(1, cfg.z_dim, device=cfg.device)
                         # z_mean, z_logvar = vr_model.encoder(e_img)
                         # z = sample_z(z_mean, z_logvar)
-                        e_rep = vr_model.decoder.get_rep(e_img, e_z)
-                        e_state = torch.cat([e_rep, e_nav], dim=1)
+                        _, e_recon = vr_model.get_noisy_reconstruction(e_img)
+                        
                         # Deterministic = True (No noise)
-                        e_action, _, _ = policy.get_action(e_state, deterministic=True)
+                        e_action, _, _ = policy.get_action(e_recon, e_nav, deterministic=True)
                     
                     e_np_act = e_action.squeeze().cpu().numpy()
                     e_next_obs, r, d, _, _ = env.step(e_np_act)
